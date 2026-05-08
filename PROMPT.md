@@ -11,10 +11,10 @@ We are building smoljail simple program thats going to shrink blast radius of ex
 smoljail \
   --id vm100 \
   --daemon
-  --smolvm-bin /usr/local/bin/smolvm \
+  --smolvm_bin /usr/local/bin/smolvm \
   --uid 10000 \
   --gid 10000 \
-  --chroot-base-dir /srv/smoljail (Default /var/lib/smolvm)
+  --chroot_base_dir /srv/smoljail (Default /var/lib/smolvm)
 
 ### Open questions?
 - What dirs are required for smolvm to function properly?
