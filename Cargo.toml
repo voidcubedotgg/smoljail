@@ -1,0 +1,8 @@
+[package]
+name = "smoljail"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = "4.6.1"
+landlock = "0.4.4"
