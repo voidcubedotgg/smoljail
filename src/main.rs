@@ -15,8 +15,8 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Gid, Pid, Uid, chdir, execve, fork, pivot_root, setgid, setgroups, setpgid, setsid,
-    setuid,
+    ForkResult, Gid, Pid, Uid, chdir, chown, execve, fork, pivot_root, setgid, setgroups, setpgid,
+    setsid, setuid,
 };
 
 const SMOLVM_SOCKET: &str = "unix:///var/run/smolvm.sock";
@@ -78,10 +78,14 @@ struct Cli {
 struct HostLayout {
     /// Directory containing `smolvm-bin` and `lib/` (parent of the ELF).
     smolvm_install_dir: PathBuf,
-    /// Host data directory (contains agent-rootfs/, etc.).
+    /// Host data directory (contains agent-rootfs/, etc.). Bound RO into the jail.
     data_dir: PathBuf,
     /// On-disk staging root (mountpoints).
     chroot_root: PathBuf,
+    /// Per-jail RW state tree on host. Bound RW onto /var/lib/smolvm-state in the jail.
+    /// Holds db/, vms/, registry-cache/, pack-cache/ — all the mutable smolvm state
+    /// that used to overlay into the data_dir or live on tmpfs.
+    state_root: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -96,7 +100,7 @@ fn main() -> Result<()> {
     }
 
     let layout = resolve_layout(&cli).context("resolving host layout")?;
-    prepare_staging(&layout).context("preparing staging mountpoints")?;
+    prepare_staging(&layout, cli.uid, cli.gid).context("preparing staging mountpoints")?;
 
     let exit_code = run_jailed(&layout, cli.uid, cli.gid).context("running jailed smolvm")?;
     std::process::exit(exit_code);
@@ -153,7 +157,9 @@ fn resolve_layout(cli: &Cli) -> Result<HostLayout> {
         );
     }
 
-    let chroot_root = cli.chroot_base_dir.join(&cli.id).join("root");
+    let jail_dir = cli.chroot_base_dir.join(&cli.id);
+    let chroot_root = jail_dir.join("root");
+    let state_root = jail_dir.join("state");
 
     if !smolvm_elf.is_file() {
         bail!("resolved smolvm ELF {} is not a file", smolvm_elf.display());
@@ -163,6 +169,7 @@ fn resolve_layout(cli: &Cli) -> Result<HostLayout> {
         smolvm_install_dir,
         data_dir,
         chroot_root,
+        state_root,
     })
 }
 
@@ -176,16 +183,22 @@ fn is_shell_script(p: &Path) -> Result<bool> {
     Ok(n == 2 && &buf == b"#!")
 }
 
+/// Names of the per-jail state subdirectories under `state_root`. Each is created on host
+/// with ownership of the dropped-priv (uid, gid), bind-mounted as part of the parent
+/// `state_root` -> `/var/lib/smolvm-state` mount, and pinned by an SMOLVM_*_DIR env var.
+const STATE_SUBDIRS: &[&str] = &["db", "vms", "registry-cache", "pack-cache"];
+
 /// Build the staging tree on host disk: empty directories that will become mount points
-/// inside the child's namespace. Nothing is copied.
-fn prepare_staging(layout: &HostLayout) -> Result<()> {
+/// inside the child's namespace, plus the host-side per-jail state tree (the bind source
+/// for /var/lib/smolvm-state).
+fn prepare_staging(layout: &HostLayout, uid: u32, gid: u32) -> Result<()> {
     let root = &layout.chroot_root;
     let dirs = [
         "",
         "opt/smolvm",
         "var/lib/smolvm",
+        "var/lib/smolvm-state",
         "var/run",
-        "var/cache/smolvm",
         "tmp",
         "proc",
         "dev",
@@ -211,6 +224,25 @@ fn prepare_staging(layout: &HostLayout) -> Result<()> {
         }
     }
 
+    // Per-jail state tree (bind source). Owned by the dropped-priv user so smolvm can
+    // write its db/caches after setuid.
+    fs::create_dir_all(&layout.state_root)
+        .with_context(|| format!("mkdir state root {}", layout.state_root.display()))?;
+    fs::set_permissions(&layout.state_root, fs::Permissions::from_mode(0o755))
+        .context("chmod state root")?;
+    chown(
+        &layout.state_root,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+    )
+    .with_context(|| format!("chown state root {}", layout.state_root.display()))?;
+    for sub in STATE_SUBDIRS {
+        let p = layout.state_root.join(sub);
+        fs::create_dir_all(&p).with_context(|| format!("mkdir {}", p.display()))?;
+        chown(&p, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .with_context(|| format!("chown {}", p.display()))?;
+    }
+
     Ok(())
 }
 
@@ -219,6 +251,7 @@ fn run_jailed(layout: &HostLayout, uid: u32, gid: u32) -> Result<i32> {
     let chroot_cstr = path_to_cstring(&layout.chroot_root)?;
     let install_src = path_to_cstring(&layout.smolvm_install_dir)?;
     let data_src = path_to_cstring(&layout.data_dir)?;
+    let state_src = path_to_cstring(&layout.state_root)?;
 
     let bin_cstr = CString::new("/opt/smolvm/smolvm-bin").unwrap();
     let argv: [CString; 6] = [
@@ -229,11 +262,17 @@ fn run_jailed(layout: &HostLayout, uid: u32, gid: u32) -> Result<i32> {
         CString::new(SMOLVM_SOCKET).unwrap(),
         CString::new("--json-logs").unwrap(),
     ];
-    let envp: [CString; 4] = [
+    // All smolvm path overrides are pinned via SMOLVM_* env vars — we no longer rely on
+    // XDG_DATA_HOME / XDG_CACHE_HOME defaults.
+    let envp: [CString; 8] = [
         CString::new("LD_LIBRARY_PATH=/opt/smolvm/lib").unwrap(),
-        CString::new("XDG_DATA_HOME=/var/lib").unwrap(),
-        CString::new("XDG_CACHE_HOME=/var/cache").unwrap(),
         CString::new("PATH=/opt/smolvm:/usr/bin:/bin").unwrap(),
+        CString::new("SMOLVM_AGENT_ROOTFS=/var/lib/smolvm/agent-rootfs").unwrap(),
+        CString::new("SMOLVM_DB_DIR=/var/lib/smolvm-state/db").unwrap(),
+        CString::new("SMOLVM_VM_CACHE_DIR=/var/lib/smolvm-state/vms").unwrap(),
+        CString::new("SMOLVM_REGISTRY_CACHE_DIR=/var/lib/smolvm-state/registry-cache").unwrap(),
+        CString::new("SMOLVM_PACK_CACHE_DIR=/var/lib/smolvm-state/pack-cache").unwrap(),
+        CString::new("SMOLVM_RUNTIME_DIR=/var/run/smolvm").unwrap(),
     ];
 
     match unsafe { fork() }.context("fork for jailed child")? {
@@ -247,6 +286,7 @@ fn run_jailed(layout: &HostLayout, uid: u32, gid: u32) -> Result<i32> {
                 &chroot_cstr,
                 &install_src,
                 &data_src,
+                &state_src,
                 &bin_cstr,
                 &argv,
                 &envp,
@@ -319,6 +359,7 @@ fn child_setup_and_exec(
     chroot_path: &CStr,
     smolvm_install_src: &CStr,
     data_src: &CStr,
+    state_src: &CStr,
     bin: &CStr,
     argv: &[CString],
     envp: &[CString],
@@ -340,7 +381,8 @@ fn child_setup_and_exec(
         die!("no_new_privs", std::io::Error::last_os_error());
     }
 
-    if let Err(e) = setup_mount_ns(chroot_path, smolvm_install_src, data_src, uid, gid) {
+    if let Err(e) = setup_mount_ns(chroot_path, smolvm_install_src, data_src, state_src, uid, gid)
+    {
         die!("mount_ns", e);
     }
 
@@ -383,6 +425,7 @@ fn setup_mount_ns(
     chroot_path: &CStr,
     smolvm_install_src: &CStr,
     data_src: &CStr,
+    state_src: &CStr,
     uid: u32,
     gid: u32,
 ) -> Result<()> {
@@ -414,15 +457,17 @@ fn setup_mount_ns(
     // Bind read-only: smolvm install dir → /opt/smolvm
     bind_ro(cstr_to_path(smolvm_install_src), &chroot.join("opt/smolvm"))?;
 
-    // Bind read-only: data dir → /var/lib/smolvm
-    let data_host = cstr_to_path(data_src);
-    bind_ro(data_host, &chroot.join("var/lib/smolvm"))?;
+    // Bind read-only: data dir → /var/lib/smolvm. No RW children punched into it —
+    // mutable state lives in /var/lib/smolvm-state below.
+    bind_ro(cstr_to_path(data_src), &chroot.join("var/lib/smolvm"))?;
 
-    // Overlay smolvm's writable server/ subdir (sqlite + redb live here).
-    let server_src = data_host.join("server");
-    if server_src.is_dir() {
-        bind_rw(&server_src, &chroot.join("var/lib/smolvm/server"))?;
-    }
+    // Bind read-write: per-jail state tree → /var/lib/smolvm-state. Holds db/, vms/,
+    // registry-cache/, pack-cache/. The host source was chowned to (uid, gid) in
+    // prepare_staging so the post-setuid smolvm can write to it.
+    bind_rw(
+        cstr_to_path(state_src),
+        &chroot.join("var/lib/smolvm-state"),
+    )?;
 
     // Bind read-only: system library trees
     for src in SYSTEM_LIB_PATHS {
@@ -456,7 +501,8 @@ fn setup_mount_ns(
     )
     .context("mount tmpfs /tmp")?;
 
-    // tmpfs at /var/run, owned by target uid/gid so smolvm can create its socket.
+    // tmpfs at /var/run, owned by target uid/gid so smolvm can create its main socket
+    // (smolvm.sock) and its per-VM ephemeral sockets/pids under /var/run/smolvm/.
     let var_run_opts = format!("mode=755,uid={uid},gid={gid}");
     mount(
         Some("tmpfs"),
@@ -467,16 +513,16 @@ fn setup_mount_ns(
     )
     .context("mount tmpfs /var/run")?;
 
-    // tmpfs at /var/cache/smolvm so smolvm has a writable cache (XDG_CACHE_HOME).
-    let cache_opts = format!("mode=755,uid={uid},gid={gid}");
-    mount(
-        Some("tmpfs"),
-        &chroot.join("var/cache/smolvm"),
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some(cache_opts.as_str()),
+    // SMOLVM_RUNTIME_DIR points at /var/run/smolvm. The tmpfs mount above is empty,
+    // so create the subdir now (still as root in the child) with the right ownership.
+    let runtime_dir = chroot.join("var/run/smolvm");
+    fs::create_dir(&runtime_dir).context("mkdir /var/run/smolvm")?;
+    chown(
+        &runtime_dir,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
     )
-    .context("mount tmpfs /var/cache/smolvm")?;
+    .context("chown /var/run/smolvm")?;
 
     // /proc — fresh procfs.
     mount::<str, _, str, str>(
@@ -617,11 +663,7 @@ fn apply_landlock() -> Result<()> {
             all,
         ))?
         .add_rule(PathBeneath::new(
-            PathFd::new("/var/cache").context("open /var/cache")?,
-            all,
-        ))?
-        .add_rule(PathBeneath::new(
-            PathFd::new("/var/lib/smolvm/server").context("open server")?,
+            PathFd::new("/var/lib/smolvm-state").context("open /var/lib/smolvm-state")?,
             all,
         ))?
         .add_rule(PathBeneath::new(
